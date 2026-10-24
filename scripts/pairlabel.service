@@ -1,0 +1,18 @@
+[Unit]
+Description=PairLabel local dual vision annotation studio
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/pairlabel
+ExecStart=/bin/bash %h/workspace/pairlabel/scripts/start.sh
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=35
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:%h/workspace/pairlabel/logs/web-service.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

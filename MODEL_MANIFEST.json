@@ -1,0 +1,39 @@
+{
+  "runtime": {
+    "llama_cpp_commit": "657e01125aa49577a62a5531fde24cbcc007006d",
+    "sam2_commit": "2b90b9f5ceec907a1c18123530e92e794ad901a4"
+  },
+  "generator": {
+    "name": "Qwen3.6-27B-Q6_K",
+    "source": "设备已有文件；本工程复用，未下载替换",
+    "upstream": "https://huggingface.co/Qwen/Qwen3.6-27B",
+    "sha256": "未另行核验，不能宣称已校验此已有文件"
+  },
+  "reviewer": {
+    "name": "InternVL3.5-14B-Q8_0",
+    "repository": "https://huggingface.co/mradermacher/InternVL3_5-14B-GGUF",
+    "revision": "2fd50d9ef8feb79d3c327d8465e82a3df572044c",
+    "files": [
+      {
+        "name": "InternVL3_5-14B.mmproj-f16.gguf",
+        "size": 705336928,
+        "sha256": "b576147e465a94486757253683964229ddb786056af006b32660341253b927c5"
+      },
+      {
+        "name": "InternVL3_5-14B.Q8_0.gguf",
+        "size": 15698531424,
+        "sha256": "2eab28cf8bd7ee584c53ceab5d7af0cedbc7297858044bd0b8f15b6fac3f90a0"
+      }
+    ]
+  },
+  "segmentation": {
+    "name": "SAM 2.1 Hiera Large",
+    "repository": "https://huggingface.co/facebook/sam2.1-hiera-large",
+    "revision": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
+    "size": 898083611,
+    "sha256": "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
+    "backend": "CPU FP32"
+  },
+  "download_policy": "新增权重通过显式禁用代理的直连下载器获取，完整文件通过上述 SHA256 校验；镜像 URL 解析到 CDN 后仍不使用代理。",
+  "inference_policy": "全本地；两路异构 VLM 顺序使用 CUDA llama.cpp，SAM 使用本地 CPU。"
+}

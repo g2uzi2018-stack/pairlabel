@@ -1,0 +1,45 @@
+# Local Python environments and generated build files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# User images, annotations, weights, logs and device-local settings
+/data/
+/models/
+/logs/
+/samples/
+/exports/
+/releases/
+/config/config.json
+/config/*.tmp
+*.gguf
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.sqlite*
+*.db
+*.zip
+*.tar.gz
+
+# Credentials and machine-specific files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+credentials*.json
+client_secret*.json
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
