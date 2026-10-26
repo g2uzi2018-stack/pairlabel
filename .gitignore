@@ -43,3 +43,19 @@ client_secret*.json
 Thumbs.db
 .idea/
 .vscode/
+
+# Device-only environments, private datasets, generated evidence and packages
+.venv-*/
+releases/
+reports/
+samples/
+*.sqlite3*
+*.gguf
+*.pt
+*.pth
+*.whl
+*.deb
+*.tar.gz
+*.egg-info/
+.env
+.env.*

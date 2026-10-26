@@ -2,13 +2,16 @@ import hashlib,json,zipfile,threading,shutil,contextlib
 from pathlib import Path
 from . import db
 from .config import DATA
+from .annotation_formats import yolo_text,coco_annotations,has_complete_polygons
+from .job_access import job_guard
 
 _export_locks={}
 def export_busy(jid):return jid in _export_locks and _export_locks[jid].locked()
 def build_export(jid,fmt='all',include_uncertain=False,val_ratio=.2):
  lock=_export_locks.setdefault(jid,threading.Lock())
  if not lock.acquire(blocking=False):raise ValueError('这项任务正在导出，请等待当前导出完成')
- try:return _build_export(jid,fmt,include_uncertain,val_ratio)
+ try:
+  with job_guard(jid):return _build_export(jid,fmt,include_uncertain,val_ratio)
  finally:lock.release()
 
 @contextlib.contextmanager
@@ -45,22 +48,16 @@ def _build_export(jid,fmt='all',include_uncertain=False,val_ratio=.2):
    result=json.loads(i['result'] or '{"objects":[]}');objs=result['objects'];w=i['width'];h=i['height'];split='val' if int(i['hash'][:8],16)/0xffffffff<val_ratio else 'train';filename=i['id']+'.png'
    record={k:i[k] for k in ['id','name','hash','width','height','status']};record.update(split=split,objects=len(objs));report['items'].append(record)
    for f in formats:
-    if f=='yolo-seg' and any(len(o.get('polygon',[]))<3 for o in objs):
+    if f=='yolo-seg' and not has_complete_polygons(objs):
      report['segmentation_excluded'].append({'id':i['id'],'reason':'缺少可靠轮廓，跳过整张图，避免丢目标'});continue
     z.write(DATA/i['path'],f'{f}/images/{split}/{filename}')
     if f=='yolo':
-     lines=[]
-     for o in objs:
-      x0,y0,x1,y1=o['bbox'];lines.append(f'{o["class_id"]} {(x0+x1)/2/w:.7f} {(y0+y1)/2/h:.7f} {(x1-x0)/w:.7f} {(y1-y0)/h:.7f}')
-     z.writestr(f'{f}/labels/{split}/{i["id"]}.txt','\n'.join(lines)+'\n' if lines else '')
+     z.writestr(f'{f}/labels/{split}/{i["id"]}.txt',yolo_text(objs,w,h))
     elif f=='yolo-seg':
-     lines=[str(o['class_id'])+' '+' '.join(f'{v:.7f}' for p in o['polygon'] for v in (p[0]/w,p[1]/h)) for o in objs];z.writestr(f'{f}/labels/{split}/{i["id"]}.txt','\n'.join(lines)+'\n')
+     z.writestr(f'{f}/labels/{split}/{i["id"]}.txt',yolo_text(objs,w,h,segmentation=True))
    if 'coco' in formats:
     coco[split]['images'].append({'id':image_id,'file_name':f'images/{split}/{filename}','width':w,'height':h,'original_name':i['name']})
-    for o in objs:
-     x0,y0,x1,y1=o['bbox'];poly=o.get('polygon',[]);area=(x1-x0)*(y1-y0)
-     if poly:area=abs(sum(poly[k][0]*poly[(k+1)%len(poly)][1]-poly[(k+1)%len(poly)][0]*poly[k][1] for k in range(len(poly))))/2
-     coco[split]['annotations'].append({'id':ann_id,'image_id':image_id,'category_id':o['class_id']+1,'bbox':[x0,y0,x1-x0,y1-y0],'area':area,'segmentation':[[v for p in poly for v in p]] if poly else [],'iscrowd':0});ann_id+=1
+    coco[split]['annotations'].extend(coco_annotations(objs,image_id,ann_id));ann_id+=len(objs)
    preview=DATA/'jobs'/jid/'results'/f'{i["id"]}.jpg'
    if preview.exists():z.write(preview,f'previews/{i["id"]}.jpg')
   if 'coco' in formats:

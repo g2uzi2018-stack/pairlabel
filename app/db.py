@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY AUTOINCREMENT,item_id TEX
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL,item_id TEXT,kind TEXT NOT NULL,detail TEXT NOT NULL,created REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS items_job ON items(job_id,status);
 ''')
+  if 'deleted_at' not in {r['name'] for r in c.execute('PRAGMA table_info(jobs)')}:
+   c.execute('ALTER TABLE jobs ADD COLUMN deleted_at REAL NOT NULL DEFAULT 0')
   # An interrupted model call is retried; completed runs remain durable.
   c.execute("UPDATE jobs SET status='paused',updated=? WHERE status='pausing'",(time.time(),))
   c.execute("UPDATE jobs SET status='queued',updated=? WHERE status='running'",(time.time(),))
@@ -39,21 +41,31 @@ def execute(sql,args=()):
 
 def audit(jid,iid,kind,detail):execute('INSERT INTO audit(job_id,item_id,kind,detail,created) VALUES(?,?,?,?,?)',(jid,iid,kind,dumps(detail),time.time()))
 
-def job(jid):
- j=one('SELECT * FROM jobs WHERE id=?',(jid,))
+def job(jid,include_deleted=False):
+ j=one('SELECT * FROM jobs WHERE id=?'+('' if include_deleted else ' AND deleted_at=0'),(jid,))
  if not j:return None
  j['config']=json.loads(j['config']);j['counts']={r['status']:r['n'] for r in rows('SELECT status,count(*) n FROM items WHERE job_id=? GROUP BY status',(jid,))};j['total']=sum(j['counts'].values())
  j['processed']=sum(j['counts'].get(s,0) for s in ['accepted','uncertain','approved','rejected','error'])
  j['runs']=one("SELECT count(*) n FROM runs JOIN items ON runs.item_id=items.id WHERE items.job_id=? AND runs.status='ok'",(jid,))['n']
+ from .progress import summarize
+ # Only scalar metadata is read; polling never loads image pixels or model outputs.
+ items=rows("SELECT id,attempt,status,json_extract(result,'$.attempt') result_attempt FROM items WHERE job_id=?",(jid,))
+ runs=rows('SELECT r.item_id,r.attempt,r.role,r.status FROM runs r JOIN items i ON i.id=r.item_id WHERE i.job_id=?',(jid,))
+ j['progress']=summarize(items,runs)
+ from .review import FAILED_SQL
+ failed=one(f'SELECT count(*) n FROM items WHERE job_id=? AND {FAILED_SQL}',(jid,))['n']
+ j['review_counts']={'failed':failed,'uncertain':j['counts'].get('uncertain',0)+j['counts'].get('error',0)-failed}
  return j
 
 def item(iid):
  i=one('SELECT * FROM items WHERE id=?',(iid,))
  if i:
   for k in ['result','issues']:i[k]=json.loads(i[k]) if i[k] else None
+  from .review import recognition_failed
+  i['recognition_failed']=recognition_failed(i)
  return i
 
-def set_job(jid,status,error=''):execute('UPDATE jobs SET status=?,error=?,updated=? WHERE id=?',(status,error,time.time(),jid))
+def set_job(jid,status,error=''):execute('UPDATE jobs SET status=?,error=?,updated=? WHERE id=? AND deleted_at=0',(status,error,time.time(),jid))
 
 def new_job(name,config):
  jid=uuid.uuid4().hex;now=time.time()

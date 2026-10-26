@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project_root="$(cd "$(dirname "$0")/.." && pwd)"
+native_libs="$project_root/.venv-sam-cuda/lib/labeler-native"
+if [[ ! -x "$project_root/.venv-sam-cuda/bin/python" || ! -d "$native_libs" ]]; then
+  echo 'SAM CUDA environment is not prepared.' >&2
+  exit 1
+fi
+export LD_LIBRARY_PATH="$native_libs:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/nvidia${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$project_root/.venv-sam-cuda/bin/python" "$@"

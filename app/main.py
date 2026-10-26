@@ -6,14 +6,17 @@ from PIL import Image,ImageOps,UnidentifiedImageError
 from fastapi import FastAPI,File,Form,HTTPException,Request,UploadFile
 from fastapi.responses import FileResponse,JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel,Field
+from pydantic import BaseModel,Field,StrictInt
 from . import db
+from .annotation_formats import format_preview
+from .job_access import job_guard
 from .config import ROOT,DATA,CLASS_PRESETS,load_config,save_config,readiness,validate
 from .profiles import is_xiangqi
 from .prompts import build_detection_prompt
 from .exports import build_export,export_busy
 from .geometry import validate_prediction
 from .pipeline import Worker,preview
+from .review import FAILED_SQL,recognition_failed,relabel
 
 worker=Worker()
 @contextlib.asynccontextmanager
@@ -23,11 +26,12 @@ async def lifespan(app):
  worker.stop()
 app=FastAPI(title='PairLabel 协标 · 本地图片自动标注',lifespan=lifespan)
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','[::1]','testserver'])
+bind_host=os.environ.get('LABELER_HOST','127.0.0.1')
+app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','[::1]','testserver',bind_host])
 
 @app.middleware('http')
 async def local_guard(request:Request,call_next):
- # Loopback-bound by default; protect mutating endpoints from cross-origin forms.
+ # Keep browser writes same-origin on both loopback and explicitly bound LAN addresses.
  if request.method in ['POST','PUT','PATCH','DELETE']:
   origin=request.headers.get('origin')
   if origin:
@@ -39,13 +43,14 @@ async def local_guard(request:Request,call_next):
 async def value_error(request,exc):return JSONResponse({'detail':str(exc)},status_code=400)
 
 @app.get('/api/health')
-def health():return {'status':'ok','local_only':True}
+def health():return {'status':'ok','local_only':bind_host in ['localhost','127.0.0.1','::1'],'listen_host':bind_host}
 @app.get('/api/status')
 def status():
  c=load_config();mem={}
  for line in Path('/proc/meminfo').read_text().splitlines():
   if line.split(':')[0] in ['MemTotal','MemAvailable']:mem[line.split(':')[0]]=int(line.split()[1])
- return {'models':readiness(c),'runtime':worker.manager.state,'memory_kb':mem,'project':str(ROOT),'download_log':(ROOT/'logs/download.log').read_text(errors='replace')[-1800:] if (ROOT/'logs/download.log').exists() else ''}
+ active=db.one("SELECT id FROM jobs WHERE status IN ('running','pausing') AND deleted_at=0 ORDER BY created LIMIT 1")
+ return {'models':readiness(c),'runtime':worker.manager.state,'active_job_id':active['id'] if active else None,'memory_kb':mem,'project':str(ROOT),'download_log':(ROOT/'logs/download.log').read_text(errors='replace')[-1800:] if (ROOT/'logs/download.log').exists() else ''}
 @app.get('/api/config')
 def get_config():return load_config()
 @app.get('/api/presets')
@@ -84,7 +89,7 @@ def put_config(c:dict):
  checked=job_config(c,{})
  save_config(checked);return {'ok':True,'note':'仅影响新任务，已有任务保持配置快照'}
 @app.get('/api/jobs')
-def jobs():return [db.job(r['id']) for r in db.rows('SELECT id FROM jobs ORDER BY created DESC LIMIT 100')]
+def jobs():return [job for r in db.rows('SELECT id FROM jobs WHERE deleted_at=0 ORDER BY created DESC LIMIT 100') if (job:=db.job(r['id']))]
 
 def require_job(jid):
  j=db.job(jid)
@@ -94,6 +99,7 @@ def require_job(jid):
 def require_item(iid):
  i=db.item(iid)
  if not i:raise HTTPException(404,'图片不存在')
+ require_job(i['job_id'])
  return i
 
 def import_image(jid,raw,name):
@@ -150,49 +156,92 @@ async def create_job(name:str=Form('图片标注任务'),directory:str=Form(''),
   db.set_job(jid,'queued');worker.wake.set();return {'job':db.job(jid),'imported':imported,'duplicates':duplicates,'errors':errors}
  except Exception as e:db.set_job(jid,'failed',str(e));raise
 
+@app.get('/api/trash')
+def trash_jobs():return [job for r in db.rows('SELECT id FROM jobs WHERE deleted_at>0 ORDER BY deleted_at DESC') if (job:=db.job(r['id'],include_deleted=True)) and job['deleted_at']]
+
+@app.delete('/api/jobs/{jid}')
+def trash_job(jid:str):
+ with job_guard(jid):
+  job=require_job(jid)
+  if job['status'] in ['running','queued','pausing','importing']:raise HTTPException(409,'请先暂停任务，等待当前识别保存后再删除')
+  if export_busy(jid):raise HTTPException(409,'正在导出该任务，请完成后再删除')
+  now=time.time()
+  with db.connection() as con:
+   con.execute('UPDATE jobs SET deleted_at=?,updated=? WHERE id=?',(now,now,jid))
+   con.execute('INSERT INTO audit(job_id,kind,detail,created) VALUES(?,?,?,?)',(jid,'trash',db.dumps({'name':job['name']}),now))
+  return {'ok':True,'id':jid,'message':'任务已移入回收站，图片和标注保留，可恢复；原始采集目录不受影响。'}
+
+@app.post('/api/trash/{jid}/restore')
+def restore_job(jid:str):
+ with job_guard(jid):
+  job=db.job(jid,include_deleted=True)
+  if not job or not job['deleted_at']:raise HTTPException(404,'回收站中没有此任务')
+  now=time.time()
+  with db.connection() as con:
+   con.execute('UPDATE jobs SET deleted_at=0,updated=? WHERE id=?',(now,jid))
+   con.execute('INSERT INTO audit(job_id,kind,detail,created) VALUES(?,?,?,?)',(jid,'restore','{}',now))
+  return require_job(jid)
+
+@app.get('/api/items/{iid}/format-preview')
+def get_format_preview(iid:str,format:str='yolo',include_uncertain:bool=False):
+ i=require_item(iid);job=require_job(i['job_id'])
+ objects=(i.get('result') or {}).get('objects',[])
+ result=format_preview(objects,i['width'],i['height'],format,job['config']['classes'])
+ allowed=['accepted','approved']+(['uncertain'] if include_uncertain else [])
+ reasons=[]
+ if job['status'] in ['running','queued','pausing','importing']:reasons.append('任务正在处理，请先暂停或等待完成再导出。')
+ if i['status'] not in allowed:reasons.append('当前图片不在导出范围：默认只含自动通过和人工确认；疑难需显式勾选包含。')
+ if not result['format_eligible']:reasons.append(result['format_reason'])
+ return {**result,'item_id':iid,'format':format,'included':not reasons,'reasons':reasons}
+
 @app.get('/api/jobs/{jid}')
 def get_job(jid:str):return require_job(jid)
 @app.get('/api/jobs/{jid}/items')
 def items(jid:str,status:str='all',offset:int=0,limit:int=100):
  require_job(jid);limit=max(1,min(limit,500));offset=max(0,offset)
  where='job_id=?';args=[jid]
- if status!='all':where+=' AND status=?';args.append(status)
+ if status in ['failed','error']:where+=' AND '+FAILED_SQL
+ elif status=='uncertain':where+=" AND status='uncertain' AND NOT "+FAILED_SQL
+ elif status!='all':where+=' AND status=?';args.append(status)
  total=db.one(f'SELECT count(*) n FROM items WHERE {where}',args)['n']
  rs=db.rows(f'SELECT * FROM items WHERE {where} ORDER BY name,id LIMIT ? OFFSET ?',[*args,limit,offset])
  for r in rs:
   r.pop('path');r['result']=json.loads(r['result']) if r['result'] else None;r['issues']=json.loads(r['issues'])
+  r['recognition_failed']=recognition_failed(r)
  return {'items':rs,'total':total,'offset':offset}
 class Action(BaseModel):
  action:str
  item_id:Optional[str]=None
 @app.post('/api/jobs/{jid}/action')
 def job_action(jid:str,body:Action):
- job=require_job(jid)
- if export_busy(jid):raise ValueError('正在导出该任务，请稍后再修改任务状态')
- if body.action=='pause':
-  if job['status'] in ['queued','running']:db.set_job(jid,'pausing' if job['status']=='running' else 'paused')
- elif body.action=='resume':
-  if job['status'] not in ['running','queued']:
-   if not readiness(job['config'])['ready']:raise ValueError('模型尚未下载完成，请稍后继续')
+ with job_guard(jid):
+  job=require_job(jid)
+  if export_busy(jid):raise ValueError('正在导出该任务，请稍后再修改任务状态')
+  if body.action=='pause':
+   if job['status'] in ['queued','running']:db.set_job(jid,'pausing' if job['status']=='running' else 'paused')
+  elif body.action=='resume':
+   if job['status'] not in ['running','queued']:
+    if not readiness(job['config'])['ready']:raise ValueError('模型尚未下载完成，请稍后继续')
+    db.set_job(jid,'queued');worker.wake.set()
+  elif body.action in ['retry_uncertain','retry_failed']:
+   if job['status'] in ['running','queued','pausing','importing']:raise ValueError('请先暂停当前任务')
+   with db.connection() as con:
+    condition=FAILED_SQL if body.action=='retry_failed' else "status IN ('uncertain','error')"
+    query=f"SELECT id,attempt FROM items WHERE job_id=? AND {condition}";params=[jid]
+    if body.item_id:
+     if con.execute("SELECT count(*) FROM items WHERE job_id=? AND status='pending'",(jid,)).fetchone()[0]:raise ValueError('任务还有待处理图片，请先完成任务后再单独重试')
+     query+=' AND id=?';params.append(body.item_id)
+    selected=con.execute(query,params).fetchall()
+    if not selected:raise ValueError('没有可重试的识别失败图片' if body.action=='retry_failed' else '没有可重试的疑难图片')
+    for r in selected:
+     # Preserve run history and increase the per-job attempt ceiling.
+     next_attempt=r['attempt']+1;con.execute("UPDATE items SET status='pending',attempt=? WHERE id=?",(next_attempt,r['id']))
+    maximum=con.execute("SELECT max(attempt) FROM items WHERE job_id=? AND status='pending'",(jid,)).fetchone()[0]
+    if maximum is None:raise ValueError('没有可重试的疑难图片')
+    cfg=job['config'];cfg['max_attempts']=max(cfg['max_attempts'],maximum+1);con.execute('UPDATE jobs SET config=? WHERE id=?',(db.dumps(cfg),jid))
    db.set_job(jid,'queued');worker.wake.set()
- elif body.action=='retry_uncertain':
-  if job['status'] in ['running','queued','pausing','importing']:raise ValueError('请先暂停当前任务')
-  with db.connection() as con:
-   query="SELECT id,attempt FROM items WHERE job_id=? AND status IN ('uncertain','error')";params=[jid]
-   if body.item_id:
-    if con.execute("SELECT count(*) FROM items WHERE job_id=? AND status='pending'",(jid,)).fetchone()[0]:raise ValueError('任务还有待处理图片，请先完成任务后再单独重试')
-    query+=' AND id=?';params.append(body.item_id)
-   selected=con.execute(query,params).fetchall()
-   if not selected:raise ValueError('没有可重试的疑难图片')
-   for r in selected:
-    # Preserve run history and increase the per-job attempt ceiling.
-    next_attempt=r['attempt']+1;con.execute("UPDATE items SET status='pending',attempt=? WHERE id=?",(next_attempt,r['id']))
-   maximum=con.execute("SELECT max(attempt) FROM items WHERE job_id=? AND status='pending'",(jid,)).fetchone()[0]
-   if maximum is None:raise ValueError('没有可重试的疑难图片')
-   cfg=job['config'];cfg['max_attempts']=max(cfg['max_attempts'],maximum+1);con.execute('UPDATE jobs SET config=? WHERE id=?',(db.dumps(cfg),jid))
-  db.set_job(jid,'queued');worker.wake.set()
- else:raise ValueError('未知操作')
- db.audit(jid,None,'job_action',{'action':body.action});return require_job(jid)
+  else:raise ValueError('未知操作')
+  db.audit(jid,None,'job_action',{'action':body.action});return require_job(jid)
 @app.get('/api/items/{iid}')
 def get_item(iid:str):
  i=require_item(iid);i.pop('path');i['runs']=db.rows('SELECT * FROM runs WHERE item_id=? ORDER BY attempt,role',(iid,))
@@ -221,27 +270,35 @@ def get_preview(iid:str):
  return FileResponse(p if p.exists() else DATA/i['path'])
 class Review(BaseModel):
  action:str
- reason:str=Field(min_length=1,max_length=2000)
+ reason:str=Field(default='',max_length=2000)
  objects:Optional[list[dict]]=None
+ class_ids:Optional[list[StrictInt]]=None
+ expected_class_ids:Optional[list[StrictInt]]=None
 @app.post('/api/items/{iid}/review')
 def manual_review(iid:str,body:Review):
  i=require_item(iid);j=require_job(i['job_id'])
- if export_busy(j['id']):raise ValueError('正在导出该任务，请稍后再修改标注')
- if j['status'] in ['running','queued','pausing','importing']:raise ValueError('请先暂停任务再人工复核，避免与自动结果相互覆盖')
- if i['status']=='pending':raise ValueError('这张图片尚未完成自动识别')
- if body.action not in ['approve','reject','edit']:raise ValueError('未知复核操作')
- result=i['result'] or {'objects':[]}
- if body.action=='edit':
-  if body.objects is None:raise ValueError('需要 objects')
-  new=validate_prediction({'objects':body.objects},j['config']['classes'],i['width'],i['height'],normalized=False)
-  result={**result,**new};result['human_edited']=True
- status='rejected' if body.action=='reject' else 'approved'
- result['human_review']={'reason':body.reason,'action':body.action,'time':time.time()}
- db.execute('UPDATE items SET status=?,result=? WHERE id=?',(status,db.dumps(result),iid))
- db.audit(i['job_id'],iid,'human_review',{'action':body.action,'reason':body.reason,'before':i['result'],'after':result})
- p=DATA/'jobs'/i['job_id']/'results';preview(DATA/i['path'],result,j['config']['classes'],p/f'{iid}.jpg')
- (p/f'{iid}.human-{time.time_ns()}.json').write_text(json.dumps({'item':iid,'action':body.action,'reason':body.reason,'result':result},ensure_ascii=False,indent=2))
- return get_item(iid)
+ with job_guard(j['id']):
+  i=require_item(iid)
+  j=require_job(i['job_id'])
+  if export_busy(j['id']):raise ValueError('正在导出该任务，请稍后再修改标注')
+  if j['status'] in ['running','queued','pausing','importing']:raise ValueError('请先暂停任务再人工复核，避免与自动结果相互覆盖')
+  if i['status']=='pending':raise ValueError('这张图片尚未完成自动识别')
+  if body.action not in ['approve','reject','edit','labels']:raise ValueError('未知复核操作')
+  if body.action!='labels' and not body.reason.strip():raise ValueError('请填写复核依据')
+  result=copy.deepcopy(i['result'] or {'objects':[]});label_changes=[];reason=body.reason.strip()
+  if body.action=='labels':
+   result,label_changes,reason=relabel(result,body.class_ids,j['config']['classes'],body.expected_class_ids)
+  if body.action=='edit':
+   if body.objects is None:raise ValueError('需要 objects')
+   new=validate_prediction({'objects':body.objects},j['config']['classes'],i['width'],i['height'],normalized=False)
+   result={**result,**new};result['human_edited']=True
+  status='rejected' if body.action=='reject' else 'approved'
+  result['human_review']={'reason':reason,'action':body.action,'time':time.time(),**({'label_changes':label_changes} if body.action=='labels' else {})}
+  db.execute('UPDATE items SET status=?,result=? WHERE id=?',(status,db.dumps(result),iid))
+  db.audit(i['job_id'],iid,'human_review',{'action':body.action,'reason':reason,'before':i['result'],'after':result})
+  p=DATA/'jobs'/i['job_id']/'results';preview(DATA/i['path'],result,j['config']['classes'],p/f'{iid}.jpg')
+  (p/f'{iid}.human-{time.time_ns()}.json').write_text(json.dumps({'item':iid,'action':body.action,'reason':reason,'result':result},ensure_ascii=False,indent=2))
+  return get_item(iid)
 class ExportOptions(BaseModel):
  format:str='all'
  include_uncertain:bool=False

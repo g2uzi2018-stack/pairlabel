@@ -33,17 +33,21 @@ class Worker:
   # Cancellation terminates only this worker's model subprocess.
   self.manager.stop()
   if self.thread:self.thread.join(timeout=10)
- def is_active(self,jid):return not self.stopping.is_set() and db.one('SELECT status FROM jobs WHERE id=?',(jid,))['status']=='running'
+ def is_active(self,jid):return not self.stopping.is_set() and bool(db.one("SELECT id FROM jobs WHERE id=? AND status='running' AND deleted_at=0",(jid,)))
  def loop(self):
   while not self.stopping.is_set():
-   j=db.one("SELECT id FROM jobs WHERE status='queued' ORDER BY created LIMIT 1")
+   j=db.one("SELECT id FROM jobs WHERE status='queued' AND deleted_at=0 ORDER BY created LIMIT 1")
    if not j:
     if self.manager.proc and time.time()-self.manager.last_use>180:self.manager.stop()
     self.wake.wait(2);self.wake.clear();continue
-   jid=j['id'];job=db.job(jid);config=job['config']
+   jid=j['id'];job=db.job(jid)
+   if not job:continue
+   config=job['config']
    if not readiness(config)['ready']:
     db.set_job(jid,'failed','模型文件未就绪；下载完成后点击继续');continue
-   db.set_job(jid,'running')
+   with db.connection() as con:
+    claimed=con.execute("UPDATE jobs SET status='running',updated=? WHERE id=? AND status='queued' AND deleted_at=0",(time.time(),jid)).rowcount
+   if not claimed:continue
    try:self.process(jid,config)
    except Exception as e:
     (ROOT/'logs').mkdir(exist_ok=True)
@@ -112,7 +116,7 @@ class Worker:
     for cid,n in counts.items():
      if n>limits.get(c['classes'][cid].get('piece'),999):issues.append({'type':'inventory','message':f'{c["classes"][cid]["label"]} 数量 {n} 超过标准棋局上限；可能误读，也可能是摆拍'})
    if c.get('segmentation'):
-    self.manager.state={'phase':'segmentation','message':'SAM 2.1 Large 正在检查轮廓','role':None,'progress':{'image':item['name'],'attempt':attempt+1,'tile':1,'tiles':1}}
+    self.manager.state={'phase':'segmentation','message':'SAM 2.1 Large 正在检查轮廓','role':None,'progress':{'image':item['name'],'attempt':attempt+1,'tile':1,'tiles':1,'started':time.time()}}
     try:
      result['objects'],segissues=self.segmenter.segment(rgb,result['objects'],c);issues+=segissues
      if c.get('retry_pixel_crops',True) and c.get('segmentation_backend','sam2')=='sam2' and chess:

@@ -32,8 +32,8 @@
     "revision": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
     "size": 898083611,
     "sha256": "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
-    "backend": "CPU FP32"
+    "backend": "auto: CPU FP32 or available CUDA FP32 (TF32 disabled)"
   },
   "download_policy": "新增权重通过显式禁用代理的直连下载器获取，完整文件通过上述 SHA256 校验；镜像 URL 解析到 CDN 后仍不使用代理。",
-  "inference_policy": "全本地；两路异构 VLM 顺序使用 CUDA llama.cpp，SAM 使用本地 CPU。"
+  "inference_policy": "全本地；两路异构 VLM 顺序使用 CUDA llama.cpp，SAM 采用可用 CUDA 或 CPU，保持 FP32 与原质量阈值。"
 }
