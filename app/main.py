@@ -37,7 +37,10 @@ async def local_guard(request:Request,call_next):
   if origin:
    from urllib.parse import urlsplit
    if urlsplit(origin).netloc!=request.headers.get('host'):return JSONResponse({'detail':'不允许跨站写入'},status_code=403)
- return await call_next(request)
+ response=await call_next(request)
+ # Always fetch the current UI shell; asset URLs carry content hashes.
+ if request.url.path in ('/','/index.html'):response.headers['Cache-Control']='no-store'
+ return response
 
 @app.exception_handler(ValueError)
 async def value_error(request,exc):return JSONResponse({'detail':str(exc)},status_code=400)
