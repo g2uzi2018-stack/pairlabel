@@ -130,3 +130,15 @@ def test_agent_cannot_overwrite_partial_human_review_with_unreadable_target():
     before=db.item(iid)
     assert agent_request(iid,[0,0]).status_code==400
     assert db.item(iid)==before
+
+
+def test_primary_reference_adjudication_has_explicit_provenance():
+    jid,iid,original=ready_item()
+    note={'key':'T1','text':'black_king','text_kind':'class_label_not_transcription','decision_source':'primary_reference_adjudication','luna_class_id':11,'reference_key':'reference-king'}
+    r=agent_request(iid,[7],observations=[note]);assert r.status_code==200
+    o=r.json()['result']['objects'][0]
+    assert o['classification_source']=='codex_primary_reference'
+    assert o['classification_review']['adjudicator']=='primary_agent'
+    assert o['classification_review']['luna_class_id']==11
+    assert o['classification_review']['text_kind']=='class_label_not_transcription'
+    assert o['bbox']==original['objects'][0]['bbox'] and o['polygon']==original['objects'][0]['polygon']

@@ -17,10 +17,16 @@ def agent_classify(item, class_ids, observations, classes, batch, recovery=None)
     for index,(obj,cid,note) in enumerate(zip(objects,class_ids,observations)):
         if cid == -1:cid=None
         old=review_class_id(obj)
-        assign_class(obj,-1 if cid is None else cid,classes,source='codex_luna')
+        decision_source=note.get('decision_source','luna_visual_review')
+        if decision_source not in ('luna_visual_review','primary_reference_adjudication'):raise ValueError('未知类别核对来源')
+        assign_class(obj,-1 if cid is None else cid,classes,source='codex_primary_reference' if decision_source=='primary_reference_adjudication' else 'codex_luna')
         if cid is None:obj['classification_reason']=str(note.get('reason') or '看不清／无法可靠分类')[:500]
         obj['classification_review']={'target_key':str(note.get('key',''))[:40],'text':str(note.get('text',''))[:30],
-                                      'state':'unreadable' if cid is None else 'readable','model':'gpt-6-luna','reasoning_effort':'max'}
+                                      'text_kind':str(note.get('text_kind','observed_or_normalized_glyph'))[:50],
+                                      'state':'unreadable' if cid is None else 'readable','model':'gpt-6-luna','reasoning_effort':'max',
+                                      'decision_source':decision_source}
+        if decision_source=='primary_reference_adjudication':
+            obj['classification_review'].update(adjudicator='primary_agent',luna_class_id=note.get('luna_class_id'),reference_key=str(note.get('reference_key',''))[:40])
         if old!=review_class_id(obj):changes.append({'index':index,'before':old,'after':review_class_id(obj)})
     assert before_geometry==[(o['bbox'],o.get('polygon',[])) for o in objects]
     result['classification_review']={'batch':batch,'model':'gpt-6-luna','reasoning_effort':'max','speed':'not_exposed','time':time.time(),
