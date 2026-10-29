@@ -16,7 +16,7 @@ from .prompts import build_detection_prompt
 from .exports import build_export,export_busy
 from .geometry import validate_prediction
 from .pipeline import Worker,preview
-from .review import FAILED_SQL,recognition_failed,relabel
+from .review import FAILED_SQL,recognition_failed,relabel,review_revision,visual_edit
 
 worker=Worker()
 @contextlib.asynccontextmanager
@@ -208,6 +208,7 @@ def items(jid:str,status:str='all',offset:int=0,limit:int=100):
  for r in rs:
   r.pop('path');r['result']=json.loads(r['result']) if r['result'] else None;r['issues']=json.loads(r['issues'])
   r['recognition_failed']=recognition_failed(r)
+  r['review_revision']=review_revision(r)
  return {'items':rs,'total':total,'offset':offset}
 class Action(BaseModel):
  action:str
@@ -274,6 +275,7 @@ class Review(BaseModel):
  objects:Optional[list[dict]]=None
  class_ids:Optional[list[StrictInt]]=None
  expected_class_ids:Optional[list[StrictInt]]=None
+ expected_revision:Optional[str]=None
 @app.post('/api/items/{iid}/review')
 def manual_review(iid:str,body:Review):
  i=require_item(iid);j=require_job(i['job_id'])
@@ -281,19 +283,24 @@ def manual_review(iid:str,body:Review):
   i=require_item(iid)
   j=require_job(i['job_id'])
   if export_busy(j['id']):raise ValueError('正在导出该任务，请稍后再修改标注')
-  if j['status'] in ['running','queued','pausing','importing']:raise ValueError('请先暂停任务再人工复核，避免与自动结果相互覆盖')
-  if i['status']=='pending':raise ValueError('这张图片尚未完成自动识别')
-  if body.action not in ['approve','reject','edit','labels']:raise ValueError('未知复核操作')
-  if body.action!='labels' and not body.reason.strip():raise ValueError('请填写复核依据')
-  result=copy.deepcopy(i['result'] or {'objects':[]});label_changes=[];reason=body.reason.strip()
+  # Worker candidates are pending items only. Other completed images remain editable
+  # during a retry; queueing and manual writes share job_guard to avoid claim races.
+  if i['status']=='pending':raise ValueError('本图正在等待或进行识别，请完成后再编辑；其他已处理图片仍可复核')
+  if body.expected_revision is not None and body.expected_revision!=i['review_revision']:raise ValueError('本图结果已更新，请重新打开图片后确认，旧修改未覆盖新结果')
+  if body.action not in ['approve','reject','edit','labels','visual']:raise ValueError('未知复核操作')
+  if body.action not in ['labels','visual'] and not body.reason.strip():raise ValueError('请填写复核依据')
+  result=copy.deepcopy(i['result'] or {'objects':[]});label_changes=[];sources=None;reason=body.reason.strip()
   if body.action=='labels':
    result,label_changes,reason=relabel(result,body.class_ids,j['config']['classes'],body.expected_class_ids)
+  if body.action=='visual':
+   if body.expected_revision is None:raise ValueError('请重新打开图片后进行可视化编辑')
+   result,sources,reason=visual_edit(i,body.objects,j['config']['classes'],i['width'],i['height'],lambda rid:db.one('SELECT * FROM runs WHERE id=?',(rid,)))
   if body.action=='edit':
    if body.objects is None:raise ValueError('需要 objects')
    new=validate_prediction({'objects':body.objects},j['config']['classes'],i['width'],i['height'],normalized=False)
    result={**result,**new};result['human_edited']=True
   status='rejected' if body.action=='reject' else 'approved'
-  result['human_review']={'reason':reason,'action':body.action,'time':time.time(),**({'label_changes':label_changes} if body.action=='labels' else {})}
+  result['human_review']={'reason':reason,'action':body.action,'time':time.time(),**({'label_changes':label_changes} if body.action=='labels' else {}),**({'object_sources':sources} if sources is not None else {})}
   db.execute('UPDATE items SET status=?,result=? WHERE id=?',(status,db.dumps(result),iid))
   db.audit(i['job_id'],iid,'human_review',{'action':body.action,'reason':reason,'before':i['result'],'after':result})
   p=DATA/'jobs'/i['job_id']/'results';preview(DATA/i['path'],result,j['config']['classes'],p/f'{iid}.jpg')

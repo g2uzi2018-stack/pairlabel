@@ -61,8 +61,9 @@ def item(iid):
  i=one('SELECT * FROM items WHERE id=?',(iid,))
  if i:
   for k in ['result','issues']:i[k]=json.loads(i[k]) if i[k] else None
-  from .review import recognition_failed
+  from .review import recognition_failed,review_revision
   i['recognition_failed']=recognition_failed(i)
+  i['review_revision']=review_revision(i)
  return i
 
 def set_job(jid,status,error=''):execute('UPDATE jobs SET status=?,error=?,updated=? WHERE id=? AND deleted_at=0',(status,error,time.time(),jid))

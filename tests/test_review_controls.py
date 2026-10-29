@@ -113,12 +113,14 @@ def test_failed_retry_does_not_queue_semantic_uncertainty_or_resolved_historical
     assert db.rows('SELECT * FROM runs') == evidence
 
 
-def test_active_task_still_blocks_manual_edits_and_retry():
+def test_active_task_allows_completed_image_review_but_blocks_retry_and_pending_edits():
     jid, iid, _ = ready_item(failed=True)
     db.set_job(jid, 'running')
     c = TestClient(app)
-    assert c.post(f'/api/items/{iid}/review', json={'action': 'labels', 'class_ids': [0]}).status_code == 400
+    assert c.post(f'/api/items/{iid}/review', json={'action': 'labels', 'class_ids': [0]}).status_code == 200
     assert c.post(f'/api/jobs/{jid}/action', json={'action': 'retry_failed'}).status_code == 400
+    db.execute("UPDATE items SET status='pending' WHERE id=?", (iid,))
+    assert c.post(f'/api/items/{iid}/review', json={'action': 'labels', 'class_ids': [0]}).status_code == 400
 
 
 def test_advanced_review_still_requires_reason():
