@@ -9,6 +9,7 @@ from .geometry import compare,circle_candidates,audit_circles,iou
 from .segmentation import Segmenter
 from .taxonomy import normalize_taxonomy
 from .profiles import is_xiangqi
+from .classification import unreadable
 
 COLORS=['#e45b4b','#3988c4','#20a47d','#ae7bdb','#d58c29','#21a2b5','#d85d97']
 def preview(path,result,classes,target):
@@ -16,12 +17,12 @@ def preview(path,result,classes,target):
  try:font=ImageFont.truetype(font_path,max(14,min(im.size)//45))
  except OSError:font=ImageFont.load_default()
  for idx,o in enumerate(result['objects']):
-  camp=classes[o['class_id']].get('color');color='#df5a4e' if camp=='red' else '#456277' if camp=='black' else COLORS[o['class_id']%len(COLORS)];b=o['bbox']
+  camp=classes[o['class_id']].get('color');color='#888888' if unreadable(o) else '#df5a4e' if camp=='red' else '#456277' if camp=='black' else COLORS[o['class_id']%len(COLORS)];b=o['bbox']
   if o.get('polygon'):draw.polygon([tuple(p) for p in o['polygon']],fill=color+'35',outline=color)
   draw.rectangle(b,outline=color,width=max(2,min(im.size)//350))
-  label=f'{idx+1} {classes[o["class_id"]]["label"]}'
+  label=f'{idx+1} '+('看不清' if unreadable(o) else classes[o['class_id']]['label'])
   try:draw.text((b[0]+2,max(0,b[1]-22)),label,font=font,fill=color,stroke_width=1,stroke_fill='white')
-  except UnicodeEncodeError:draw.text((b[0]+2,max(0,b[1]-15)),str(o['class_id']),font=font,fill=color)
+  except UnicodeEncodeError:draw.text((b[0]+2,max(0,b[1]-15)),'?' if unreadable(o) else str(o['class_id']),font=font,fill=color)
  im.thumbnail((2000,2000));im.save(target,format='JPEG',quality=92)
 
 class Worker:

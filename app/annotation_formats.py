@@ -1,5 +1,6 @@
 """Shared export encoders and read-back previews; previews never run inference."""
 import json
+from .classification import unreadable,require_readable
 
 FORMATS = ('yolo', 'yolo-seg', 'coco')
 
@@ -9,6 +10,7 @@ def has_complete_polygons(objects):
 
 
 def yolo_text(objects, width, height, segmentation=False):
+    require_readable(objects)
     lines = []
     for o in objects:
         if segmentation:
@@ -21,6 +23,7 @@ def yolo_text(objects, width, height, segmentation=False):
 
 
 def coco_annotations(objects, image_id=1, first_id=1):
+    require_readable(objects)
     annotations = []
     for index, o in enumerate(objects):
         x0, y0, x1, y1 = o['bbox']
@@ -39,6 +42,9 @@ def coco_annotations(objects, image_id=1, first_id=1):
 def format_preview(objects, width, height, fmt, classes):
     if fmt not in FORMATS:
         raise ValueError('不支持的预览格式')
+    if any(unreadable(o) for o in objects):
+        return {'objects':objects,'annotation':'','format_eligible':False,
+                'format_reason':'存在看不清／无法可靠分类的目标，整图暂不导出，避免遗漏目标或导出旧类别。'}
     complete = has_complete_polygons(objects)
     if fmt == 'yolo-seg' and not complete:
         return {'objects': [], 'annotation': '', 'format_eligible': False,

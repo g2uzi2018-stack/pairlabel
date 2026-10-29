@@ -16,7 +16,8 @@ from .prompts import build_detection_prompt
 from .exports import build_export,export_busy
 from .geometry import validate_prediction
 from .pipeline import Worker,preview
-from .review import FAILED_SQL,recognition_failed,relabel,review_revision,visual_edit
+from .review import FAILED_SQL,recognition_failed,relabel,review_revision,visual_edit,agent_classify
+from .classification import unreadable
 
 worker=Worker()
 @contextlib.asynccontextmanager
@@ -301,10 +302,17 @@ def manual_review(iid:str,body:Review):
   if body.action=='edit':
    if body.objects is None:raise ValueError('需要 objects')
    new=validate_prediction({'objects':body.objects},j['config']['classes'],i['width'],i['height'],normalized=False)
+   from .classification import assign_class
+   for source,obj in zip(body.objects,new['objects']):
+    if unreadable(source):assign_class(obj,-1,j['config']['classes'])
    result={**result,**new};result['human_edited']=True
-  status='rejected' if body.action=='reject' else 'approved'
+  status='rejected' if body.action=='reject' else ('uncertain' if any(unreadable(o) for o in result['objects']) else 'approved')
   result['human_review']={'reason':reason,'action':body.action,'time':time.time(),**({'label_changes':label_changes} if body.action=='labels' else {}),**({'object_sources':sources} if sources is not None else {})}
-  db.execute('UPDATE items SET status=?,result=? WHERE id=?',(status,db.dumps(result),iid))
+  issues=[issue for issue in (i['issues'] or []) if issue.get('type')!='classification_unreadable']
+  if any(unreadable(o) for o in result['objects']):
+   issues=[issue for issue in issues if issue.get('type')!='inference_error']
+   issues.append({'type':'classification_unreadable','message':'存在看不清／无法可靠分类的目标，暂缓训练导出'})
+  db.execute('UPDATE items SET status=?,result=?,issues=? WHERE id=?',(status,db.dumps(result),db.dumps(issues),iid))
   db.audit(i['job_id'],iid,'human_review',{'action':body.action,'reason':reason,'before':i['result'],'after':result})
   p=DATA/'jobs'/i['job_id']/'results';preview(DATA/i['path'],result,j['config']['classes'],p/f'{iid}.jpg')
   (p/f'{iid}.human-{time.time_ns()}.json').write_text(json.dumps({'item':iid,'action':body.action,'reason':reason,'result':result},ensure_ascii=False,indent=2))
@@ -313,6 +321,41 @@ class ExportOptions(BaseModel):
  format:str='all'
  include_uncertain:bool=False
  val_ratio:float=.2
+
+class ClassificationReview(BaseModel):
+ class_ids:list[Optional[StrictInt]]
+ observations:list[dict]
+ expected_revision:str
+ batch:str=Field(min_length=1,max_length=100)
+ source_run_id:Optional[StrictInt]=None
+
+@app.post('/api/items/{iid}/classification-review')
+def classification_review(iid:str,body:ClassificationReview):
+ i=require_item(iid);j=require_job(i['job_id'])
+ with job_guard(j['id']):
+  i=require_item(iid);j=require_job(i['job_id'])
+  if export_busy(j['id']):raise ValueError('正在导出，请稍后保存类别核对')
+  if (i['result'] or {}).get('classification_review',{}).get('batch')==body.batch:return get_item(iid)
+  if i['status'] in ('approved','rejected') or (i['result'] or {}).get('human_review'):raise ValueError('保留已有人工结果，不自动覆盖')
+  if i['status']=='pending':raise ValueError('本图正在识别，请完成后再核对')
+  if i['review_revision']!=body.expected_revision:raise ValueError('本图结果已更新，类别核对未覆盖新结果')
+  recovery=None
+  if body.source_run_id is not None:
+   run=db.one('SELECT * FROM runs WHERE id=? AND item_id=? AND status=?',(body.source_run_id,iid,'ok'))
+   if not run:raise ValueError('轮廓来源不属于本图的成功模型记录')
+   recovery=(json.loads(run['prediction']) or {}).get('objects',[])
+   if not recovery or any(len(o.get('polygon',[]))<3 for o in recovery):raise ValueError('采用结果必须保留已有有效轮廓')
+  result,issues,changes=agent_classify(i,body.class_ids,body.observations,j['config']['classes'],body.batch,recovery)
+  status='uncertain' if issues else 'accepted'
+  detail={'source':'codex_agent','model':'gpt-6-luna','reasoning_effort':'max','speed':'not_exposed','batch':body.batch,
+          'before':i['result'],'before_issues':i['issues'],'after':result,'changes':changes,'source_run_id':body.source_run_id}
+  with db.connection() as con:
+   con.execute('UPDATE items SET status=?,result=?,issues=? WHERE id=?',(status,db.dumps(result),db.dumps(issues),iid))
+   con.execute('INSERT INTO audit(job_id,item_id,kind,detail,created) VALUES(?,?,?,?,?)',(j['id'],iid,'agent_classification_review',db.dumps(detail),time.time()))
+  p=DATA/'jobs'/j['id']/'results';preview(DATA/i['path'],result,j['config']['classes'],p/f'{iid}.jpg')
+  (p/f'{iid}.agent-{time.time_ns()}.json').write_text(json.dumps(detail,ensure_ascii=False,indent=2))
+  return get_item(iid)
+
 @app.post('/api/jobs/{jid}/export')
 def prepare_export(jid:str,body:ExportOptions):
  p=build_export(jid,body.format,body.include_uncertain,body.val_ratio)

@@ -4,6 +4,7 @@ from . import db
 from .config import DATA
 from .annotation_formats import yolo_text,coco_annotations,has_complete_polygons
 from .job_access import job_guard
+from .classification import unreadable
 
 _export_locks={}
 def export_busy(jid):return jid in _export_locks and _export_locks[jid].locked()
@@ -28,11 +29,15 @@ def _build_export(jid,fmt='all',include_uncertain=False,val_ratio=.2):
  if job['status'] in ['running','queued','pausing','importing']:raise ValueError('请先暂停任务，或等待任务完成后导出，以保证快照一致')
  classes=job['config']['classes'];items=db.rows('SELECT * FROM items WHERE job_id=? ORDER BY name,id',(jid,))
  selected=[i for i in items if i['status'] in (['accepted','approved','uncertain'] if include_uncertain else ['accepted','approved'])]
+ classification_excluded=[{'id':i['id'],'name':i['name'],'reason':'存在看不清／无法可靠分类的目标，整图暂不导出'} for i in selected if any(unreadable(o) for o in json.loads(i['result'] or '{}').get('objects',[]))]
+ excluded_ids={i['id'] for i in classification_excluded}
+ selected=[i for i in selected if i['id'] not in excluded_ids]
  if not selected:raise ValueError('没有符合条件的结果；默认只导出自动通过或人工确认的图片')
  destdir=DATA/'exports';destdir.mkdir(exist_ok=True)
  import uuid
  dest=destdir/f'{jid}-{uuid.uuid4().hex[:10]}-{fmt}.zip';temp=dest.with_suffix('.tmp')
  report={'job_id':jid,'name':job['name'],'classes':classes,'include_uncertain':include_uncertain,'val_ratio':val_ratio,'coordinate_system':'原图像素，EXIF 方向已统一；YOLO 导出归一化；COCO 类别 ID 从 1 开始','items':[],'segmentation_excluded':[],'quality_note':'双模型一致不是准确率证明。分割轮廓通过的是掩膜自评与启发式检查，未经人工真值校准。','config':job['config']}
+ report['classification_excluded']=classification_excluded
  formats=['yolo','yolo-seg','coco'] if fmt=='all' else [fmt]
  estimated=sum((DATA/i['path']).stat().st_size for i in selected)*len(formats)
  if estimated>shutil.disk_usage(destdir).free*.9:raise ValueError('磁盘空间不足，请选择单一导出格式或缩小任务')

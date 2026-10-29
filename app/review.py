@@ -1,5 +1,40 @@
 """Shared review classification and label-only edits, preserving geometry/evidence."""
-import copy,hashlib,json
+import copy,hashlib,json,time
+from .classification import assign_class,review_class_id
+
+
+def agent_classify(item, class_ids, observations, classes, batch, recovery=None):
+    """Only relabel canonical geometry; AI review is never human approval."""
+    result=copy.deepcopy(item.get('result') or {'objects':[]})
+    objects=result.setdefault('objects',[])
+    if recovery is not None:
+        if objects:raise ValueError('仅允许为空结果采用已有模型轮廓')
+        objects.extend(copy.deepcopy(recovery))
+    if not objects or len(class_ids)!=len(objects) or len(observations)!=len(objects):
+        raise ValueError('类别核对数量必须与已有目标一一对应')
+    before_geometry=copy.deepcopy([(o['bbox'],o.get('polygon',[])) for o in objects])
+    changes=[]
+    for index,(obj,cid,note) in enumerate(zip(objects,class_ids,observations)):
+        if cid == -1:cid=None
+        old=review_class_id(obj)
+        assign_class(obj,-1 if cid is None else cid,classes,source='codex_luna')
+        if cid is None:obj['classification_reason']=str(note.get('reason') or '看不清／无法可靠分类')[:500]
+        obj['classification_review']={'target_key':str(note.get('key',''))[:40],'text':str(note.get('text',''))[:30],
+                                      'state':'unreadable' if cid is None else 'readable','model':'gpt-6-luna','reasoning_effort':'max'}
+        if old!=review_class_id(obj):changes.append({'index':index,'before':old,'after':review_class_id(obj)})
+    assert before_geometry==[(o['bbox'],o.get('polygon',[])) for o in objects]
+    result['classification_review']={'batch':batch,'model':'gpt-6-luna','reasoning_effort':'max','speed':'not_exposed','time':time.time(),
+                                     'changed_objects':len(changes),'geometry_preserved':True,'recovered_existing_contour':recovery is not None}
+    from .classification import unreadable
+    resolved={'class','color_unknown','ambiguous_text','low_confidence','classification_unreadable'}
+    if recovery is not None:resolved.update(('empty','missed'))
+    prior=item.get('issues')
+    if prior is None:prior=result.get('issues',[])
+    issues=[copy.deepcopy(issue) for issue in (prior or []) if issue.get('type') not in resolved]
+    result['classification_review']['remaining_quality_issues']=len(issues)
+    issues += [{'type':'classification_unreadable','message':f'目标 {index+1} 看不清／无法可靠分类'} for index,o in enumerate(objects) if unreadable(o)]
+    result['issues']=issues
+    return result,issues,changes
 
 # The final item can be 'uncertain' even when a model request failed. Historical
 # failed calls from earlier attempts do not classify a subsequently resolved item.
@@ -40,12 +75,9 @@ def visual_edit(item, edits, classes, width, height, load_run):
             if key in seen:raise ValueError('同一来源目标被重复添加')
             seen.add(key)
             if edit.get('bbox')!=obj['bbox']:raise ValueError('来源框已变化，请重新打开图片，或重新画框')
-        obj['class_id']=edit.get('class_id')
+        assign_class(obj,edit.get('class_id'),classes)
         # Validate without rebuilding the object: retain canonical source masks and metadata.
         validate_prediction({'objects':[obj]},classes,width,height,normalized=False)
-        color=classes[obj['class_id']].get('color')
-        if color in ('red','black'):obj['color']=color
-        else:obj.pop('color',None)
         if kind=='run':obj['annotation_source']='human_adopted_model';obj['human_source_run']=ref['run_id']
         objects.append(obj);sources.append(copy.deepcopy(ref))
     result['objects']=objects;result['human_edited']=True
@@ -65,26 +97,22 @@ def relabel(result, class_ids, classes, expected=None):
         raise ValueError('没有可修改的目标，请重试识别，或用高级编辑补充目标')
     if class_ids is None or len(class_ids) != len(objects):
         raise ValueError('类别数量与目标数量不一致，请刷新后重新确认')
-    old_ids = [o['class_id'] for o in objects]
+    old_ids = [review_class_id(o) for o in objects]
     if expected is not None and expected != old_ids:
         raise ValueError('类别已被其他操作更新，请重新打开图片后确认')
     by_id = {c['id']: c for c in classes}
-    if any(type(cid) is not int or cid not in by_id for cid in class_ids):
+    if any(type(cid) is not int or (cid != -1 and cid not in by_id) for cid in class_ids):
         raise ValueError('选择的类别不在本任务类别清单中')
     changes = []
     for index, (obj, cid) in enumerate(zip(objects, class_ids)):
-        if cid == obj['class_id']:
+        if cid == review_class_id(obj):
             continue
-        changes.append({'index': index, 'before': obj['class_id'], 'after': cid})
-        obj['class_id'] = cid
-        if by_id[cid].get('color') in ('red', 'black'):
-            obj['color'] = by_id[cid]['color']
-        else:
-            obj.pop('color', None)
+        changes.append({'index': index, 'before': review_class_id(obj), 'after': cid})
+        assign_class(obj,cid,classes)
     if changes:
         result['human_edited'] = True
     reason = '用户确认本图标签（类别未修改）。'
     if changes:
         reason = '用户确认类别修改：' + '；'.join(
-            f"目标 {c['index']+1}：{by_id[c['before']]['label']} → {by_id[c['after']]['label']}" for c in changes)
+            f"目标 {c['index']+1}：{by_id[c['before']]['label'] if c['before']!=-1 else '看不清'} → {by_id[c['after']]['label'] if c['after']!=-1 else '看不清'}" for c in changes)
     return result, changes, reason
